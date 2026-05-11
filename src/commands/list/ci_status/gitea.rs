@@ -37,36 +37,12 @@
 
 use serde::Deserialize;
 use std::process::Output;
-use worktrunk::git::{Repository, parse_owner_repo};
+use worktrunk::git::Repository;
 
 use super::{
-    CiBranchName, CiSource, CiStatus, PrStatus, is_retriable_error, non_interactive_cmd, parse_json,
+    CiBranchName, CiSource, CiStatus, PrStatus, branch_owner_repo, is_retriable_error,
+    non_interactive_cmd, output_error_text, parse_json, retriable_pr_error,
 };
-
-/// Resolve `(owner, repo)` for the branch's effective Gitea remote.
-///
-/// For a remote branch ref (e.g. `gitea/feature`), reads the branch's own
-/// remote — so a `wt list --remotes --full` row queries the right repo in a
-/// mixed-remote setup. Uses [`Repository::effective_remote_url`] to honor
-/// `url.insteadOf` rewrites, matching the GitHub path's
-/// `github_owner_repo_for_branch`.
-///
-/// For a local branch (no `branch.remote`), falls back to the primary remote's
-/// *raw* URL — matching `git::remote_ref::gitea`'s `pr:` resolver. The raw URL
-/// is enough here: only owner/repo (the path) are read, and `tea` resolves the
-/// host from its own login config rather than the URL we pass.
-fn gitea_owner_repo_for_branch(
-    repo: &Repository,
-    branch: &CiBranchName,
-) -> Option<(String, String)> {
-    let url = if let Some(remote_name) = &branch.remote {
-        repo.effective_remote_url(remote_name)
-    } else {
-        let remote = repo.primary_remote().ok()?;
-        repo.remote_url(&remote)
-    }?;
-    parse_owner_repo(&url)
-}
 
 /// Run `tea api <path>` from the worktree root.
 ///
@@ -82,17 +58,6 @@ fn tea_api(repo: &Repository, path: &str) -> Option<Output> {
         .ok()
 }
 
-/// Combine stderr and stdout for retriable-error sniffing. `tea` reports API
-/// errors as a JSON `{"message": "..."}` on stdout, but transport errors land
-/// on stderr — check both.
-fn error_text(output: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    )
-}
-
 /// Fetch the combined CI status for a commit SHA.
 ///
 /// Returns `Some(CiStatus::Error)` for retriable failures (rate limit, network),
@@ -106,7 +71,10 @@ fn fetch_combined_status(
     let path = format!("repos/{owner}/{repo_name}/commits/{sha}/status");
     let output = tea_api(repo, &path)?;
     if !output.status.success() {
-        return is_retriable_error(&error_text(&output)).then_some(CiStatus::Error);
+        // The PR-status warning from `retriable_pr_error` is the wrong shape
+        // here (this returns just CiStatus); reuse `output_error_text` so
+        // both stdout and stderr are sniffed.
+        return is_retriable_error(&output_error_text(&output)).then_some(CiStatus::Error);
     }
     let combined: GiteaCombinedStatus = parse_json(&output.stdout, "tea api commit status", sha)?;
     if combined.total_count == 0 {
@@ -125,21 +93,22 @@ pub(super) fn detect_gitea_pr(
     branch: &CiBranchName,
     local_head: &str,
 ) -> Option<PrStatus> {
-    let (owner, repo_name) = gitea_owner_repo_for_branch(repo, branch)?;
+    let (owner, repo_name) = branch_owner_repo(repo, branch)?;
 
     // `state=open` is required: the pulls list returns all states by default.
     let path = format!("repos/{owner}/{repo_name}/pulls?state=open");
     let output = tea_api(repo, &path)?;
     if !output.status.success() {
-        return is_retriable_error(&error_text(&output)).then(PrStatus::error);
+        return retriable_pr_error(&output);
     }
 
     let prs: Vec<GiteaPr> = parse_json(&output.stdout, "tea api pulls", &branch.full_name)?;
 
     // Match by head branch name; require the head repo owner (when present) to
-    // be the repo we queried — same-repo PRs only, since this branch looks at
-    // the primary remote alone (fork PRs are out of scope). A missing owner is
-    // treated as a potential match, as in the GitHub path.
+    // be the repo we queried — same-repo PRs only, since the resolver scopes
+    // owner/repo to the branch's own remote (fork PRs are out of scope; see
+    // the module-level "Known limitations"). A missing owner is treated as a
+    // potential match, as in the GitHub path.
     let pr = prs.iter().find(|pr| {
         pr.head.ref_name == branch.name
             && pr
@@ -187,7 +156,7 @@ pub(super) fn detect_gitea_commit_status(
     branch: &CiBranchName,
     local_head: &str,
 ) -> Option<PrStatus> {
-    let (owner, repo_name) = gitea_owner_repo_for_branch(repo, branch)?;
+    let (owner, repo_name) = branch_owner_repo(repo, branch)?;
     let ci_status = fetch_combined_status(repo, &owner, &repo_name, local_head)?;
     Some(PrStatus {
         ci_status,
@@ -267,12 +236,13 @@ mod tests {
         assert_eq!(parse_gitea_status_state("bogus"), None);
     }
 
-    /// Local branches (no `branch.remote`) walk the `else` arm — primary
-    /// remote's raw URL. Asserts directly against `gitea_owner_repo_for_branch`
-    /// so coverage doesn't depend on the spawn-based `tea --version` probe in
-    /// the integration tests.
+    /// Local branches walk the push-destination chain; with no explicit
+    /// pushRemote and no tracking, the primary remote is the fallback.
+    /// Asserts directly against the shared resolver so coverage doesn't
+    /// depend on the spawn-based `tea --version` probe in the integration
+    /// tests.
     #[test]
-    fn test_gitea_owner_repo_for_branch_local_uses_primary_remote() {
+    fn test_branch_owner_repo_local_uses_primary_remote() {
         let test = TestRepo::with_initial_commit();
         test.run_git(&[
             "remote",
@@ -282,21 +252,23 @@ mod tests {
         ]);
         let repo = Repository::at(test.root_path()).unwrap();
 
+        // Use a name that doesn't exist locally — `push_remote_url` returns
+        // None for it, so we land on the primary-remote fallback.
         let branch = CiBranchName {
-            full_name: "main".to_string(),
+            full_name: "ghost-local".to_string(),
             remote: None,
-            name: "main".to_string(),
+            name: "ghost-local".to_string(),
         };
         assert_eq!(
-            gitea_owner_repo_for_branch(&repo, &branch),
+            branch_owner_repo(&repo, &branch),
             Some(("owner".to_string(), "test-repo".to_string()))
         );
     }
 
     /// A branch whose remote has no URL (e.g., a stale ref to a deleted
-    /// remote) propagates `None` through the `?` on the if-else expression.
+    /// remote) propagates `None` through `branch_remote_url`.
     #[test]
-    fn test_gitea_owner_repo_for_branch_returns_none_when_remote_missing() {
+    fn test_branch_owner_repo_returns_none_when_remote_missing() {
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
@@ -305,14 +277,14 @@ mod tests {
             remote: Some("ghost".to_string()),
             name: "feature".to_string(),
         };
-        assert_eq!(gitea_owner_repo_for_branch(&repo, &branch), None);
+        assert_eq!(branch_owner_repo(&repo, &branch), None);
     }
 
-    /// Remote-branch refs walk the `if` arm — branch.remote's effective URL.
-    /// In a mixed-remote repo, this must pick the branch's remote, not the
+    /// Remote-branch refs read from `branch.remote`'s effective URL. In a
+    /// mixed-remote repo, this must pick the branch's remote, not the
     /// primary one.
     #[test]
-    fn test_gitea_owner_repo_for_branch_remote_uses_branch_remote() {
+    fn test_branch_owner_repo_remote_uses_branch_remote() {
         let test = TestRepo::with_initial_commit();
         test.run_git(&[
             "remote",
@@ -334,8 +306,36 @@ mod tests {
             name: "feature".to_string(),
         };
         assert_eq!(
-            gitea_owner_repo_for_branch(&repo, &branch),
+            branch_owner_repo(&repo, &branch),
             Some(("forkowner".to_string(), "test-repo".to_string()))
+        );
+    }
+
+    /// A Forgejo / non-canonically-named Gitea host (e.g. `codeberg.org`)
+    /// must still resolve through `branch_owner_repo` — the platform comes
+    /// from explicit `forge.platform` config, so the host heuristic
+    /// (`is_gitea` substring check) is not used here. Re-introducing such a
+    /// filter would silently drop CI status for legitimate Forgejo users
+    /// (see `src/git/ci_platform.rs:186`).
+    #[test]
+    fn test_branch_owner_repo_resolves_non_canonical_gitea_host() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://codeberg.org/owner/test-repo.git",
+        ]);
+        let repo = Repository::at(test.root_path()).unwrap();
+
+        let branch = CiBranchName {
+            full_name: "ghost-local".to_string(),
+            remote: None,
+            name: "ghost-local".to_string(),
+        };
+        assert_eq!(
+            branch_owner_repo(&repo, &branch),
+            Some(("owner".to_string(), "test-repo".to_string()))
         );
     }
 }

@@ -12,10 +12,12 @@ mod github;
 mod gitlab;
 mod platform;
 
+use std::process::Output;
+
 use anstyle::{AnsiColor, Color, Style};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use worktrunk::git::{BranchRef, Repository};
+use worktrunk::git::{BranchRef, Repository, parse_owner_repo};
 use worktrunk::shell_exec::Cmd;
 use worktrunk::utils::epoch_now;
 
@@ -128,6 +130,64 @@ fn parse_json<T: DeserializeOwned>(stdout: &[u8], command: &str, branch: &str) -
     serde_json::from_slice(stdout)
         .map_err(|e| log::warn!("Failed to parse {} JSON for {}: {}", command, branch, e))
         .ok()
+}
+
+/// Combine stderr and stdout for retriable-error sniffing.
+///
+/// Some CLIs (notably `tea`) report API errors as JSON on stdout while
+/// transport errors land on stderr — checking both avoids missing retriable
+/// errors when the tool routes them differently.
+fn output_error_text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+}
+
+/// If a non-success `Output` indicates a retriable failure, surface it as a
+/// PR-status warning. Returns `None` for non-retriable failures so callers
+/// can `?` it to fall through to "no CI status".
+fn retriable_pr_error(output: &Output) -> Option<PrStatus> {
+    is_retriable_error(&output_error_text(output)).then(PrStatus::error)
+}
+
+/// Resolve `(owner, repo)` for a branch's effective remote.
+///
+/// Thin wrapper over [`branch_remote_url`] + [`parse_owner_repo`]. The
+/// platform was already chosen upstream by [`Repository::ci_platform`] —
+/// either from explicit `forge.platform` config or from the URL host —
+/// so backends don't re-filter here. Re-checking via the host heuristic
+/// (`is_gitea` / `is_github`) would silently drop legitimate hosts that
+/// rely on the explicit override (e.g. `codeberg.org` for Forgejo,
+/// `git.mycompany.com` for self-hosted GHE).
+fn branch_owner_repo(repo: &Repository, branch: &CiBranchName) -> Option<(String, String)> {
+    parse_owner_repo(&branch_remote_url(repo, branch)?)
+}
+
+/// Resolve the effective URL for a branch's remote without parsing.
+///
+/// Resolution chain:
+/// - Remote-branch refs (`origin/feature`) read from the branch's own
+///   remote via [`Repository::effective_remote_url`] (honors
+///   `url.insteadOf` rewrites).
+/// - Local branches prefer the branch's push destination
+///   (`branch.<n>.pushRemote` → `remote.pushDefault` → tracking remote),
+///   falling back to the repo's primary remote so a tracking-less branch
+///   still resolves.
+///
+/// Backends with their own URL parser (e.g. Azure DevOps' org/project shape)
+/// compose this directly; backends that want `(owner, repo)` use
+/// [`branch_owner_repo`].
+fn branch_remote_url(repo: &Repository, branch: &CiBranchName) -> Option<String> {
+    if let Some(remote_name) = &branch.remote {
+        repo.effective_remote_url(remote_name)
+    } else {
+        repo.branch(&branch.name).push_remote_url().or_else(|| {
+            let remote = repo.primary_remote().ok()?;
+            repo.effective_remote_url(&remote)
+        })
+    }
 }
 
 /// Check if stderr indicates a retriable error (rate limit, network issues)
@@ -557,5 +617,52 @@ mod tests {
         let style = stale.style();
         // Just verify it doesn't panic and returns a style
         let _ = format!("{style}test{style:#}");
+    }
+
+    /// Build a synthetic non-success `Output` with the given stderr/stdout
+    /// bodies — `Command::output()` is the only "real" constructor and
+    /// would require spawning a process. Status uses `ExitStatus::default()`
+    /// (success), but the retriable-error helpers ignore status and only
+    /// look at the bytes.
+    fn fake_output(stderr: &str, stdout: &str) -> Output {
+        Output {
+            status: Default::default(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// `output_error_text` must combine both streams — `tea` routes API
+    /// errors to stdout while transport errors land on stderr, so a
+    /// stderr-only sniff would miss rate-limit messages from the JSON body.
+    #[test]
+    fn test_output_error_text_combines_streams() {
+        let out = fake_output("transport: connection reset", r#"{"message":"rate limit"}"#);
+        let text = output_error_text(&out);
+        assert!(text.contains("transport: connection reset"));
+        assert!(text.contains("rate limit"));
+    }
+
+    /// `retriable_pr_error` returns `Some(PrStatus::error())` when either
+    /// stream contains a retriable marker, and `None` otherwise — the
+    /// fall-through case where `?` propagates "no CI status".
+    #[test]
+    fn test_retriable_pr_error_routing() {
+        // Retriable from stderr.
+        let out = fake_output("HTTP 429 Too Many Requests", "");
+        let status = retriable_pr_error(&out).expect("retriable should yield Some");
+        assert_eq!(status.ci_status, CiStatus::Error);
+
+        // Retriable from stdout (the `tea` shape).
+        let out = fake_output("", r#"{"message":"rate limit exceeded"}"#);
+        assert!(retriable_pr_error(&out).is_some());
+
+        // Non-retriable failure → None, so caller's `?` falls through.
+        let out = fake_output("not found", "");
+        assert!(retriable_pr_error(&out).is_none());
+
+        // No body at all → None.
+        let out = fake_output("", "");
+        assert!(retriable_pr_error(&out).is_none());
     }
 }
